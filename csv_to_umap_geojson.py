@@ -3,7 +3,7 @@
 csv_to_umap_geojson.py
 
 Usage :
-    python csv_to_umap_geojson.py --input "Listing SECLIN.csv"
+    python csv_to_umap_geojson.py --input "ListingElectoral.csv"
 
 Fonctions :
  - Création des GeoJSON (umap, not_geocoded, incomplete, duplicates)
