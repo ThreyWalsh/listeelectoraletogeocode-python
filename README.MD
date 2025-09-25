@@ -28,12 +28,16 @@ python csv_to_umap_geojson.py --input "ListingElectoral.csv"
 
 ## Fichiers de sortie
 - Dans /results
-| Fichier  | Rôle | Contenu au fil du temps |
+
+
+| Fichier  | Rôle | Contenu (au fil du temps) |
 | --- | --- | --- |
 | geocache.json | Cache « classique » : mémorise toutes les adresses déjà géocodées (anciennes et nouvelles) pour éviter de refaire des requêtes Nominatim. | → À chaque exécution : on relit l’existant;on ajoute les nouvelles adresses rencontrées dans le CSV courant; il grandit uniquement selon les adresses que vous traitez (pas celles que vous n’avez jamais dans vos CSV). |
 | geocache_new.json | Cache cumulatif des nouveautés : sert de « journal » de toutes les adresses jamais vues comme nouvelles lors d’une exécution. | → Il ne se contente pas du CSV actuel : il garde en mémoire chaque adresse qui a été ajoutée un jour au cache, même si elle avait déjà été rencontrée dans un run précédent; il constitue l’historique de tous les ajouts successifs. |
 
 - Dans les dossiers horodatés:
+
+
 | Fichier  | Contenu |
 | --- | --- |
 | output_umap.geojson | Points géocodés |
