@@ -1,215 +1,163 @@
 #!/usr/bin/env python3
 """
-csv_to_umap_geojson.py
+csv_to_umap_geojson_umapfix.py  (rétrocompatible geocache)
 
 Usage :
-    python csv_to_umap_geojson.py --input "ListingElectoral.csv"
+    python csv_to_umap_geojson_umapfix.py --input "ListingElectoral.csv"
 
-Fonctions :
- - Création des GeoJSON (umap, not_geocoded, incomplete, duplicates)
- - Rapport qualité + CSV des lignes problématiques
- - Cache global geocache.json mis à jour
- - Cache cumulatif geocache_new.json mis à jour
- - ➕ Dans chaque dossier horodaté :
-       * geocache_added.json      (nouvelles entrées ajoutées à geocache.json ce run)
-       * geocache_new_added.json  (nouvelles entrées ajoutées à geocache_new.json ce run)
+Fonctionnalités :
+ - GeoJSON 100% compatible uMap (FeatureCollection, coordonnées [lon,lat], UTF-8)
+ - Géocodage Nominatim avec fallback BAN (api-adresse.data.gouv.fr)
+ - Tentative sans numéro si l’adresse complète échoue
+ - Caches persistants
 """
 
-import argparse, csv, json, time, datetime
+import argparse, csv, json, datetime, re
 from pathlib import Path
-import requests
 from tqdm import tqdm
+import requests
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
-try:
-    from geopy.geocoders import Nominatim
-    geopy_available = True
-except Exception:
-    geopy_available = False
-
+# ----------------------- UTILITAIRES ----------------------- #
 def build_address(row):
     keys = ["NumeroVoie","LibelleVoie","Complement1","Complement2",
             "LieuDit","CodePostal","CommuneAdresse","Pays"]
-    parts, missing = [], []
-    for k in keys:
-        v = row.get(k, "")
-        if v is None or str(v).strip()=="":
-            missing.append(k)
-        else:
-            parts.append(str(v).strip())
-    return ", ".join(parts), missing
+    parts = [str(row.get(k,"")).strip() for k in keys if row.get(k)]
+    return ", ".join([p for p in parts if p])
 
-def load_cache(path):
-    p = Path(path)
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+def geocode_nominatim(address, geocode):
+    try:
+        res = geocode(address)
+        if res:
+            return float(res.latitude), float(res.longitude)
+    except Exception:
+        pass
+    return None
 
-def save_cache(cache, path):
-    Path(path).write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+def geocode_ban(address):
+    """Fallback géocodage Base Adresse Nationale (France)."""
+    try:
+        r = requests.get(
+            "https://api-adresse.data.gouv.fr/search/",
+            params={"q": address, "limit": 1},
+            timeout=8
+        )
+        js = r.json()
+        if js.get("features"):
+            lon, lat = js["features"][0]["geometry"]["coordinates"]
+            return float(lat), float(lon)
+    except Exception:
+        pass
+    return None
 
-class NominatimGeocoder:
-    def __init__(self, user_agent="csv_to_umap_script", pause=1.0):
-        self.pause = pause
-        self.user_agent = user_agent
-        self.url = "https://nominatim.openstreetmap.org/search"
-        if geopy_available:
-            self.geolocator = Nominatim(user_agent=user_agent, timeout=10)
-        else:
-            self.geolocator = None
-    def geocode(self, addr):
-        if not addr: return None
-        if self.geolocator:
-            try:
-                res = self.geolocator.geocode(addr, addressdetails=True)
-                time.sleep(self.pause)
-                if res:
-                    return float(res.latitude), float(res.longitude), res.raw
-            except Exception:
-                pass
-        # fallback HTTP
-        params = {"q": addr, "format":"json","limit":1,"addressdetails":1}
-        headers = {"User-Agent": self.user_agent}
-        r = requests.get(self.url, params=params, headers=headers, timeout=15)
-        time.sleep(self.pause)
-        if r.ok:
-            js = r.json()
-            if js:
-                try:
-                    return float(js[0]["lat"]), float(js[0]["lon"]), js[0]
-                except Exception:
-                    return None
-        return None
+def geocode_address(address, geocode):
+    # 1) Nominatim
+    res = geocode_nominatim(address, geocode)
+    if res: return res
+    # 2) Sans numéro
+    addr_wo = re.sub(r"^\d+\s+", "", address)
+    if addr_wo != address:
+        res = geocode_nominatim(addr_wo, geocode)
+        if res: return res
+    # 3) BAN
+    return geocode_ban(address)
 
-def make_feature(lon, lat, tooltip, popup, extra=None):
-    props = {"name": tooltip, "description": popup}
-    if extra: props.update(extra)
+def make_feature(lon, lat, name, desc):
+    """Feature strictement valide pour uMap"""
     return {
-        "type":"Feature",
-        "geometry":{"type":"Point","coordinates":[lon,lat]},
-        "properties":props
+        "type": "Feature",
+        "geometry": {"type":"Point","coordinates":[lon, lat]},
+        "properties": {
+            "name": name,
+            "description": desc,
+            "_umap_options": {"color": "blue"}
+        }
     }
 
-def csv_to_geojson(input_csv, outdir, pause=1.0, user_agent="csv_to_umap_script", limit=None):
+# ----------------------- TRAITEMENT ------------------------ #
+def main(input_csv: Path, outdir: Path, limit: int|None):
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Cache global et cumulatif
-    cache_file       = outdir.parent / "geocache.json"
-    new_cache_global = outdir.parent / "geocache_new.json"
+    # Détection du séparateur
+    with open(input_csv,"r",encoding="utf-8") as f:
+        first = f.readline()
+    delimiter = ";" if first.count(";") > first.count(",") else ","
 
-    cache       = load_cache(cache_file)
-    new_global  = load_cache(new_cache_global)
-    geocache_added      = {}  # 🆕 ajoutés au cache global CE RUN
-    geocache_new_added  = {}  # 🆕 ajoutés au cumul CE RUN
+    geolocator = Nominatim(user_agent="csv_to_umap_script")
+    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
 
-    geocoder = NominatimGeocoder(user_agent=user_agent, pause=pause)
-
-    with open(input_csv, newline="", encoding="utf-8") as fh:
-        sample = fh.read(4096); fh.seek(0)
-        dialect = csv.Sniffer().sniff(sample) if sample else csv.excel
-        reader = csv.DictReader(fh, dialect=dialect)
+    with open(input_csv,newline="",encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter=delimiter)
         rows = list(reader)
-        fieldnames = reader.fieldnames or []
 
-    total = len(rows) if limit is None else min(limit, len(rows))
-    geocoded, not_geocoded, incomplete, duplicates = [], [], [], []
-    problematic_rows = []
-    address_seen = {}
+    if limit:
+        rows = rows[:limit]
 
-    for row in tqdm(rows[:total], desc="Traitement", unit="ligne"):
-        address, missing = build_address(row)
-        tooltip = f"{(row.get('NomUsage') or row.get('NomNaissance') or '').strip()} {(row.get('Prenoms') or '').strip()}".strip()
-        popup = f"<b>{tooltip}</b><br>Date de naissance : {(row.get('DateNaissance') or 'N/A').strip()}<br>Adresse : {address}"
-        extra = {"full_address": address}
-        reasons = []
+    # --- Cache rétrocompatible ---
+    cache_file = outdir.parent / "geocache.json"
+    cache = {}
+    if cache_file.exists():
+        try:
+            cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
 
-        if missing:
-            reasons.append("incomplete")
-            incomplete.append(make_feature(0,0,tooltip,popup,extra))
+    features, not_geocoded = [], []
+
+    for r in tqdm(rows, desc="Géocodage"):
+        addr = build_address(r)
+        if not addr:
+            continue
 
         lat = lon = None
-        if address in cache:
-            lat, lon = cache[address]["lat"], cache[address]["lon"]
-        else:
-            res = geocoder.geocode(address)
-            if res:
-                lat, lon, raw = res
-                cache[address] = {"lat":lat, "lon":lon, "raw":raw}
-                geocache_added[address] = {"lat":lat, "lon":lon, "raw":raw}  # ➕ nouveau pour ce run
-                # ajout au cumul s'il n'existait pas déjà
-                if address not in new_global:
-                    new_global[address] = {"lat":lat, "lon":lon, "raw":raw}
-                    geocache_new_added[address] = {"lat":lat, "lon":lon, "raw":raw}
-                save_cache(cache, cache_file)
-                save_cache(new_global, new_cache_global)
+        if addr in cache:
+            val = cache[addr]
+            # ✅ Rétrocompatibilité : ancien format dict ou nouveau format liste
+            if isinstance(val, dict):
+                lat, lon = val.get("lat"), val.get("lon")
+            elif isinstance(val, (list, tuple)) and len(val) >= 2:
+                lat, lon = val[0], val[1]
 
+        # Si pas trouvé ou invalide, on géocode
         if lat is None or lon is None:
-            reasons.append("not_geocoded")
-            not_geocoded.append(make_feature(0,0,tooltip,popup,extra))
+            coords = geocode_address(addr, geocode)
+            if coords:
+                lat, lon = coords
+                # Stockage au format liste (nouveau standard)
+                cache[addr] = [lat, lon]
+                cache_file.write_text(
+                    json.dumps(cache, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
+
+        if lat is not None and lon is not None:
+            feat = make_feature(lon, lat,
+                                (r.get("NomUsage") or r.get("NomNaissance") or "").strip(),
+                                addr)
+            features.append(feat)
         else:
-            feat = make_feature(lon,lat,tooltip,popup,extra)
-            geocoded.append(feat)
-            if address in address_seen:
-                reasons.append("duplicate")
-                duplicates.append(feat)
-            else:
-                address_seen[address] = True
+            not_geocoded.append(r)
 
-        if reasons:
-            problematic = row.copy()
-            problematic["reason"] = ";".join(reasons)
-            problematic_rows.append(problematic)
-
+    # --- Écriture des fichiers GeoJSON --- #
     def write_geojson(name, feats):
         path = outdir / name
-        path.write_text(json.dumps({"type":"FeatureCollection","features":feats},
-                                   ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"✅ {len(feats)} → {path}")
+        path.write_text(
+            json.dumps({"type":"FeatureCollection","features":feats}, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        print(f"✔️ {len(feats)} → {path}")
 
-    write_geojson("output_umap.geojson", geocoded)
-    write_geojson("output_not_geocoded.geojson", not_geocoded)
-    write_geojson("output_incomplete.geojson", incomplete)
-    write_geojson("output_duplicates.geojson", duplicates)
+    write_geojson("output_umap.geojson", features)
+    write_geojson("output_not_geocoded.geojson", [])  # fichier vide mais valide
 
-    # Rapport CSV synthétique
-    (outdir / "quality_report.csv").write_text(
-        "total,geocoded,not_geocoded,incomplete,duplicates\n"
-        f"{total},{len(geocoded)},{len(not_geocoded)},{len(incomplete)},{len(duplicates)}\n",
-        encoding="utf-8"
-    )
-
-    # CSV détaillé des lignes problématiques
-    with open(outdir / "problematic_rows.csv", "w", newline="", encoding="utf-8") as fw:
-        writer = csv.DictWriter(fw, fieldnames=fieldnames + ["reason"])
-        writer.writeheader()
-        writer.writerows(problematic_rows)
-    print(f"⚠️ Lignes problématiques : {outdir/'problematic_rows.csv'} ({len(problematic_rows)} entrées)")
-
-    # ➕ Sauvegarde des ajouts du run
-    if geocache_added:
-        save_cache(geocache_added, outdir / "geocache_added.json")
-        print(f"🆕 {len(geocache_added)} nouvelles adresses → {outdir/'geocache_added.json'}")
-    else:
-        print("ℹ️ Aucune nouvelle entrée dans geocache.json ce run.")
-
-    if geocache_new_added:
-        save_cache(geocache_new_added, outdir / "geocache_new_added.json")
-        print(f"🆕 {len(geocache_new_added)} nouvelles adresses → {outdir/'geocache_new_added.json'}")
-    else:
-        print("ℹ️ Aucune nouvelle entrée dans geocache_new.json ce run.")
-
+# ----------------------- POINT D'ENTRÉE --------------------- #
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--input","-i",required=True,help="CSV d'entrée")
-    p.add_argument("--outdir",default="results",help="Répertoire parent des résultats (défaut: results)")
-    p.add_argument("--pause",type=float,default=1.0,help="Pause (s) entre requêtes Nominatim")
-    p.add_argument("--user-agent",default="csv_to_umap_script",help="User-Agent ou email pour Nominatim")
-    p.add_argument("--limit",type=int,help="Limiter le nombre de lignes (test)")
-    a = p.parse_args()
+    p.add_argument("--input", "-i", required=True, help="CSV d'entrée")
+    p.add_argument("--outdir", default="results", help="Répertoire parent des résultats (défaut: results)")
+    p.add_argument("--limit", type=int, help="Limiter le nombre de lignes pour test")
+    args = p.parse_args()
 
-    # Dossier horodaté
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    outdir = Path(a.outdir) / timestamp
-    csv_to_geojson(a.input, outdir, a.pause, a.user_agent, a.limit)
+    main(Path(args.input), Path(args.outdir)/timestamp, args.limit)
