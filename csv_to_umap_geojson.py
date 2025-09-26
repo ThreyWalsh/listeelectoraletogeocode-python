@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-csv_to_umap_geojson_umapfix.py  (rétrocompatible geocache)
+csv_to_umap_geojson.py 
 
 Usage :
     python csv_to_umap_geojson_umapfix.py --input "ListingElectoral.csv"
