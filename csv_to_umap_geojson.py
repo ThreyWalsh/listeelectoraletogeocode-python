@@ -3,7 +3,7 @@
 csv_to_umap_geojson_umapfix.py  (rétrocompatible geocache)
 
 Usage :
-    python csv_to_umap_geojson_umapfix.py --input "Listing SECLIN.csv" [--limit 100]
+    python csv_to_umap_geojson_umapfix.py --input "ListingElectoral.csv"
 
 Fonctionnalités :
  - GeoJSON 100% compatible uMap (FeatureCollection, coordonnées [lon,lat], UTF-8)
